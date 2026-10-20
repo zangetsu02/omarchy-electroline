@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "id": "zangetsu.electroline",
+  "name": "Electroline",
+  "version": "1.2.0",
+  "author": "Christian Palladini",
+  "license": "MIT",
+  "description": "Electroline (Hisense) air conditioners in the Omarchy bar: power, setpoint, mode and fan speed for every unit on the ConnectLife account, through Hisense's cloud.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Electroline",
+    "description": "Drive the air conditioners from the bar: on and off, temperature, mode and fan. The units answer nothing on the LAN, so every command goes through the ConnectLife cloud.",
+    "category": "Home",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 120,
+      "openRefreshIntervalSec": 10,
+      "pythonPath": "",
+      "hideWhenAllOff": false,
+      "maxCallsPerMinute": 20
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while the panel is closed (seconds)",
+        "description": "Hisense can lock an account that polls too hard, so this stays slow. Nobody is reading the bar closely anyway.",
+        "min": 30,
+        "max": 3600,
+        "step": 10,
+        "defaultValue": 120
+      },
+      {
+        "key": "openRefreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while the panel is open (seconds)",
+        "description": "Faster, because a command takes a few seconds to come back from the cloud and the panel has to show when it has.",
+        "min": 5,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "maxCallsPerMinute",
+        "type": "integer",
+        "label": "Most cloud calls per minute",
+        "description": "A hard ceiling on everything this widget sends, polls included. Calls over the budget wait rather than being dropped. Hisense can lock an account that calls too often.",
+        "min": 6,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 20
+      },
+      {
+        "key": "pythonPath",
+        "type": "path",
+        "label": "Python interpreter",
+        "description": "Leave empty to use the virtualenv that scripts/setup-electroline creates in ~/.local/share/omarchy-electroline.",
+        "defaultValue": ""
+      },
+      {
+        "key": "hideWhenAllOff",
+        "type": "boolean",
+        "label": "Hide the icon while every unit is off",
+        "defaultValue": false
+      }
+    ]
+  }
+}

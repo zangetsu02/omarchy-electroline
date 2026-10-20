@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""A fake cloud, so the panel can be looked at without a ConnectLife account.
+
+It stands in for the interpreter, not the bridge: point the widget's
+"Python interpreter" setting at this file and it answers every call itself,
+keeping the pretend state in ~/.cache/omarchy-electroline-mock.json.
+
+Remove the setting to go back to the real cloud.
+"""
+
+import json
+import os
+import sys
+
+STATE = os.path.expanduser("~/.cache/omarchy-electroline-mock.json")
+
+DEFAULT = [
+    {"puid": "mock-studio", "name": "Studio", "room": "Studio", "online": True,
+     "power": 1, "target": 24, "current": 26.5, "mode": 2, "fan": 0,
+     "eco": 0, "sleep": 0, "swing": 1},
+    {"puid": "mock-camera", "name": "Camera", "room": "Camera", "online": True,
+     "power": 0, "target": 22, "current": 24.0, "mode": 1, "fan": 5,
+     "eco": 1, "sleep": 2, "swing": 0},
+]
+
+PROPERTIES = {"power": "t_power", "target": "t_temp", "current": "f_temp_in",
+              "mode": "t_work_mode", "fan": "t_fan_speed", "eco": "t_eco",
+              "sleep": "t_sleep", "swing": "t_up_down"}
+BY_PROPERTY = {v: k for k, v in PROPERTIES.items()}
+
+
+def load():
+    try:
+        with open(STATE) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return [dict(unit) for unit in DEFAULT]
+
+
+def save(units):
+    with open(STATE, "w") as handle:
+        json.dump(units, handle)
+
+
+def status(units):
+    return {"units": [dict(unit, properties=dict(PROPERTIES)) for unit in units]}
+
+
+def main():
+    # argv: <bridge path> <command> [args...] - the bridge itself is unused.
+    args = sys.argv[2:]
+    if not args:
+        print(json.dumps({"error": "mock: no command", "needsLogin": False}))
+        return 1
+    units = load()
+    if args[0] == "set":
+        puid, assignments = args[1], args[2:]
+        for unit in units:
+            if unit["puid"] != puid:
+                continue
+            for assignment in assignments:
+                name, value = assignment.split("=", 1)
+                field = BY_PROPERTY.get(name)
+                if field:
+                    unit[field] = int(value)
+        save(units)
+    print(json.dumps(status(units)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Bridge between the bar widget and the ConnectLife cloud.
+
+The appliances answer nothing on the LAN: every command goes through Hisense's
+cloud, the same path the phone app takes. This script is the only place that
+knows how to talk to it; the QML side only reads the JSON it prints.
+
+    status                  one line of JSON describing every air conditioner
+    set <puid> <k=v> ...    write properties, then print the status again
+    dump                    every property the appliances report, raw
+    authorize               print the URL that starts the browser sign-in
+    token <redirect-url>    exchange the code in that URL and store the tokens
+
+Tokens live in the login keyring under service=connectlife-omarchy, never on
+disk. `status` and `set` refresh them on their own when they expire.
+"""
+
+import asyncio
+import json
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+from connectlife.api import DEFAULT_OAUTH_REDIRECT_URI as REDIRECT_URI
+from connectlife.api import LifeConnectAuthError, LifeConnectError
+from connectlife.oauth import (
+    OAUTH2_AUTHORIZE_URL,
+    OAUTH2_CLIENT_ID,
+    OAUTH2_CLIENT_SECRET,
+    OAUTH2_TOKEN_URL,
+    OAuthConnectLifeApi,
+    generate_source_id,
+)
+
+KEYRING_SERVICE = "connectlife-omarchy"
+
+# Hisense names the same thing differently on different models, so each field is
+# a list of candidates and the first one a unit actually reports wins. A unit
+# that reports none leaves the field null and the panel greys out that control.
+# Names and their values come from the Home Assistant data dictionary for device
+# type 009 (air conditioner).
+FIELDS = {
+    "power": ["t_power"],
+    "target": ["t_temp"],
+    "current": ["f_temp_in"],
+    "mode": ["t_work_mode"],
+    "fan": ["t_fan_speed"],
+    "eco": ["t_eco"],
+    "sleep": ["t_sleep"],
+    # shortcut: on/off vertical swing only. Units that expose the richer
+    # t_swing_angle (seven positions) show nothing here; map it when one turns
+    # up in a dump.
+    "swing": ["t_up_down"],
+}
+
+
+class BridgeError(Exception):
+    """Something the panel should show instead of a traceback."""
+
+    def __init__(self, message, needs_login=False):
+        super().__init__(message)
+        self.needs_login = needs_login
+
+
+# --- token storage ---------------------------------------------------------
+
+
+def load_tokens():
+    out = subprocess.run(
+        ["secret-tool", "lookup", "service", KEYRING_SERVICE],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        raise BridgeError("Not signed in to ConnectLife. Run scripts/setup-electroline.",
+                          needs_login=True)
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        raise BridgeError("The stored ConnectLife token is not readable. Sign in again.",
+                          needs_login=True)
+
+
+def save_tokens(tokens):
+    subprocess.run(
+        ["secret-tool", "store", "--label=ConnectLife (Omarchy)", "service", KEYRING_SERVICE],
+        input=json.dumps(tokens), text=True, check=True,
+    )
+
+
+def _post_token(payload):
+    body = urllib.parse.urlencode(payload).encode()
+    request = urllib.request.Request(OAUTH2_TOKEN_URL, body)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as err:
+        raise BridgeError(f"The sign-in was rejected ({err.code}). Sign in again.",
+                          needs_login=True) from err
+    except OSError as err:
+        raise BridgeError(f"Could not reach the ConnectLife sign-in: {err}") from err
+
+
+def _store_response(response, source_id):
+    if "access_token" not in response:
+        raise BridgeError("The sign-in returned no token.", needs_login=True)
+    tokens = {
+        "access_token": response["access_token"],
+        # A response without a new refresh token keeps the old one.
+        "refresh_token": response.get("refresh_token", ""),
+        "expires_at": time.time() + int(response.get("expires_in", 3600)),
+        "source_id": source_id,
+    }
+    return tokens
+
+
+def refresh_tokens(tokens):
+    if not tokens.get("refresh_token"):
+        raise BridgeError("The ConnectLife sign-in expired. Sign in again.", needs_login=True)
+    response = _post_token({
+        "grant_type": "refresh_token",
+        "refresh_token": tokens["refresh_token"],
+        "client_id": OAUTH2_CLIENT_ID,
+        "client_secret": OAUTH2_CLIENT_SECRET,
+    })
+    fresh = _store_response(response, tokens.get("source_id") or generate_source_id())
+    # The server may answer without a new refresh token; the old one stays valid.
+    fresh["refresh_token"] = fresh["refresh_token"] or tokens["refresh_token"]
+    save_tokens(fresh)
+    return fresh
+
+
+# --- sign-in ---------------------------------------------------------------
+
+
+def authorize_url():
+    query = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": OAUTH2_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "state": generate_source_id()[:12],
+    })
+    return f"{OAUTH2_AUTHORIZE_URL}?{query}"
+
+
+def exchange_code(redirect_url):
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(redirect_url).query)
+    codes = query.get("code")
+    if not codes:
+        raise BridgeError("That address carries no ?code=. Copy the whole address bar.")
+    response = _post_token({
+        "grant_type": "authorization_code",
+        "code": codes[0],
+        "redirect_uri": REDIRECT_URI,
+        "client_id": OAUTH2_CLIENT_ID,
+        "client_secret": OAUTH2_CLIENT_SECRET,
+    })
+    save_tokens(_store_response(response, generate_source_id()))
+
+
+# --- cloud -----------------------------------------------------------------
+
+
+def build_api():
+    state = {"tokens": load_tokens()}
+
+    async def access_token():
+        tokens = state["tokens"]
+        # A token that dies mid-request would cost a retry, so renew it a minute
+        # early instead.
+        if tokens.get("expires_at", 0) - 60 <= time.time():
+            tokens = refresh_tokens(tokens)
+            state["tokens"] = tokens
+        return tokens["access_token"]
+
+    return OAuthConnectLifeApi(access_token, source_id=state["tokens"].get("source_id"))
+
+
+def pick(status_list, candidates):
+    for name in candidates:
+        if name in status_list:
+            return name, status_list[name]
+    return None, None
+
+
+def describe(appliance):
+    status_list = appliance.status_list or {}
+    unit = {
+        "puid": appliance.puid,
+        "name": appliance.device_nickname or appliance.room_name or appliance.device_type_name,
+        "room": appliance.room_name or "",
+        # 1 means online; anything else means the cloud has lost the unit and a
+        # command would go nowhere.
+        "online": appliance.offline_state == 1,
+        "properties": {},
+    }
+    for field, candidates in FIELDS.items():
+        name, value = pick(status_list, candidates)
+        unit[field] = value
+        unit["properties"][field] = name
+    return unit
+
+
+def is_air_conditioner(appliance):
+    # Going by the reported properties rather than the device type code: the
+    # code varies by model, while a unit without t_power has nothing this
+    # widget could drive anyway.
+    return any(name in (appliance.status_list or {}) for name in FIELDS["power"])
+
+
+async def collect(api):
+    try:
+        appliances = await api.get_appliances()
+    except LifeConnectAuthError as err:
+        raise BridgeError("The ConnectLife sign-in expired. Sign in again.", needs_login=True) from err
+    except LifeConnectError as err:
+        raise BridgeError(f"The ConnectLife cloud did not answer: {err}") from err
+    return appliances
+
+
+async def run_status(api):
+    appliances = await collect(api)
+    return {"units": [describe(a) for a in appliances if is_air_conditioner(a)]}
+
+
+async def run_dump(api):
+    appliances = await collect(api)
+    return {"appliances": [{
+        "puid": a.puid,
+        "name": a.device_nickname,
+        "room": a.room_name,
+        "typeCode": a.device_type_code,
+        "featureCode": a.device_feature_code,
+        "offlineState": a.offline_state,
+        "status": {k: str(v) for k, v in (a.status_list or {}).items()},
+    } for a in appliances]}
+
+
+async def run_set(api, puid, assignments):
+    properties = {}
+    for assignment in assignments:
+        if "=" not in assignment:
+            raise BridgeError(f"Not a property assignment: {assignment}")
+        key, value = assignment.split("=", 1)
+        properties[key.strip()] = value.strip()
+    if not properties:
+        raise BridgeError("Nothing to set.")
+    try:
+        await api.update_appliance(puid, properties)
+    except LifeConnectAuthError as err:
+        raise BridgeError("The ConnectLife sign-in expired. Sign in again.", needs_login=True) from err
+    except LifeConnectError as err:
+        raise BridgeError(f"The command was not accepted: {err}") from err
+    # The cloud needs a moment before it reports the new values, so the status
+    # returned here can still be the old one. The panel shows what it asked for
+    # until a later poll says otherwise.
+    return await run_status(api)
+
+
+async def main_async(argv):
+    command = argv[0]
+    if command not in ("status", "dump", "set"):
+        raise BridgeError(f"Unknown command: {command}")
+    api = build_api()
+    if command == "status":
+        return await run_status(api)
+    if command == "dump":
+        return await run_dump(api)
+    if len(argv) < 3:
+        raise BridgeError("Usage: set <puid> <key=value> ...")
+    return await run_set(api, argv[1], argv[2:])
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        if argv[0] == "authorize":
+            print(authorize_url())
+            return 0
+        if argv[0] == "token":
+            if len(argv) < 2:
+                raise BridgeError("Usage: token <redirect-url>")
+            exchange_code(argv[1])
+            print(json.dumps({"ok": True}))
+            return 0
+        print(json.dumps(asyncio.run(main_async(argv))))
+        return 0
+    except BridgeError as err:
+        print(json.dumps({"error": str(err), "needsLogin": err.needs_login}))
+        return 1
+    except Exception as err:  # noqa: BLE001 - the panel gets a line, not a traceback
+        print(json.dumps({"error": f"{type(err).__name__}: {err}", "needsLogin": False}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

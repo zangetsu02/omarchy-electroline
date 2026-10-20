@@ -1,0 +1,67 @@
+#!/bin/bash
+# One-time setup for the Electroline widget: a private virtualenv for the
+# ConnectLife library, then the browser sign-in whose tokens land in the
+# keyring. Safe to run again; signing in again just replaces the tokens.
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bridge="$here/connectlife-bridge"
+venv="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-electroline/venv"
+python="$venv/bin/python"
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+command -v secret-tool >/dev/null 2>&1 ||
+	die "secret-tool is missing. Install libsecret, and make sure a keyring is running."
+
+if [[ ! -x "$python" ]]; then
+	echo "Creating the virtualenv in $venv"
+	mkdir -p "$(dirname "$venv")"
+	python3 -m venv "$venv" || die "could not create the virtualenv"
+fi
+
+echo "Installing the connectlife library"
+"$venv/bin/pip" install --quiet --upgrade connectlife || die "could not install connectlife"
+
+if [[ "${1:-}" != "--sign-in-only" ]] && "$python" "$bridge" status >/dev/null 2>&1; then
+	read -rp "Already signed in. Sign in again? [y/N] " again
+	[[ "$again" == [yY]* ]] || { echo "Keeping the current sign-in."; exit 0; }
+fi
+
+url="$("$python" "$bridge" authorize)"
+cat <<MSG
+
+Open this in your browser and sign in the same way you do in the app
+(Google, Apple, Facebook, Microsoft or a password):
+
+$url
+
+The browser will land on a Swagger page that looks empty or broken. That is
+fine: what matters is the address bar, which will contain ?code=...
+
+MSG
+read -rp "Paste the whole address here: " redirect
+[[ -n "$redirect" ]] || die "nothing pasted"
+
+"$python" "$bridge" token "$redirect" >/dev/null || die "the sign-in could not be completed"
+echo "Signed in. Tokens stored in the keyring."
+
+echo
+echo "Air conditioners found:"
+"$python" "$bridge" status | "$python" -c '
+import json, sys
+data = json.load(sys.stdin)
+if "error" in data:
+    sys.exit(data["error"])
+units = data.get("units", [])
+if not units:
+    sys.exit("No air conditioner reported t_power. Run: connectlife-bridge dump")
+for unit in units:
+    missing = [k for k, v in unit["properties"].items() if v is None]
+    note = "  (not reported: " + ", ".join(missing) + ")" if missing else ""
+    print(f'"'"'  {unit["name"]}  {unit["puid"]}{note}'"'"')
+'
